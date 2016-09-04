@@ -5,4 +5,4 @@ The file `QC_score_creation.txt` contains the pipeline used to create the URVs s
 The files `Figurex.R` show how the main figure in the paper have been generated.
 
 NOTE:
-This is intended as an illustration of the pipeline used to process the data. Since we are not authorized individual level data, the orginal input files are not shared.
+This is intended as an illustration of the pipeline used to process the data. Since we are not authorized to share individual level data, the orginal input files are not included.
