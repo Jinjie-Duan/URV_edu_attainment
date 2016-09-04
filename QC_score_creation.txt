@@ -1,0 +1,143 @@
+
+### STEP 1: QC USING HAIL ###
+## More info about hail here: https://hail.is/ ##
+
+hail importvcf original_vcf.bgz splitmulti \
+filtervariants expr --keep -c 'va.pass' \
+filtersamples list --keep -i samples_to_remove.sample_list \
+filtergenotypes --remove -c '(g.isHet && ((g.ad[0] / g.dp) < 0.2 || (g.ad[0] / g.dp) > 0.8)) || g.gq < 20 ' \
+variantqc \
+filtervariants expr --keep -c 'va.qc.callRate > 0.80 && va.qc.MAC > 0' \
+exportvcf -o output_vcf.vcf.bgz \
+write -o output_vds.vds
+
+
+### STEP 2: RUN THIS TO HAVE THE LIST ON SINGLETONS IN YOUR STUDY ##
+hail read -i output_vds.vds \
+variantqc \
+filtervariants --keep -c 'va.qc.nNonRef == 1' \
+exportgenotypes -c 'v, s.id' -o SWE.singles
+
+
+
+### STEP 3: RUN snpEff TO ANNOTATE THE .VCF ###
+## Requires snpEff, SnpSift and bcftools installed ###
+
+ref="/path_to_human_genome_reference/human_g1k_v37.fasta" ## This the reference human genome in .fasta, which is needed by bcftools
+exac="ExAC.r0.3.nonpsych.sites.norm.vcf.gz" ## Exac dataset, can be downloaded here: ftp://ftp.broadinstitute.org/pub/ExAC_release
+dbnsfp="dbNSFP2.9.txt.gz" ## dbNSFP2.9 dataset, can be downloaded here: https://www.googledrive.com/host/0B7Ms5xMSFMYlSTY5dDJjcHVRZ3M
+dbnsfp_fields="$(echo {SIFT,Polyphen2_H{DIV,VAR},LRT,Mutation{Taste,Assesso}r,FATHMM,PROVEAN}_pred clinvar_{clnsig,trait} COSMIC_{ID,CNT})"
+
+bcftools view -Ou -c 0 -G output_vcf.vcf.bgz | 
+bcftools norm -Ou -f $ref |
+bcftools annotate -Ou -x ID |
+bcftools view -c 0 -Ou |
+bcftools filter -e 'INFO/AC == 0' |
+  java -Xmx6g -jar snpEff.jar -c $jarpath/snpEff.config GRCh37.75 - |
+  java -Xmx2g -jar SnpSift.jar annotate -name EXAC -info AC $exac - |
+  java -Xmx2g -jar SnpSift.jar dbnsfp -v -f $(echo $dbnsfp_fields|tr ' ' ',') -db $dbnsfp - |
+
+  grep -v "^##bcftools\|^##SnpEff\|^##SnpSift" |
+  bgzip > output_vcf.annot.vcf.gz &&
+  tabix -f output_vcf.annot.vcf.gz
+
+
+### STEP 4: SAVE VARIANTS WITH DIFFERENT ANNOTATIONS ###
+## require SnpSift, bcftools and bedtools
+
+vcf="output_vcf.annot.vcf.gz"
+
+
+snpsift="java -Xmx2g -jar SnpSift.jar"
+known="knownGene.txt.gz"  ## This list is available on the github repository
+
+bcftools query -i "EXACAC>0" -f "%CHROM:%POS:%REF:%ALT\n" $vcf | sort | uniq > exac
+
+$snpsift filter "ANN[0].IMPACT = 'HIGH'" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > high
+
+$snpsift filter "(ANN[0].IMPACT = 'MODERATE') & (ANN[0].EFFECT =~ 'inframe')" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > inframe
+
+$snpsift filter "(ANN[0].IMPACT = 'HIGH') & (ANN[0].EFFECT =~ 'protein_protein_contact')" $vcf |
+      bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > protein_protein_contact
+
+$snpsift filter "ANN[0].IMPACT = 'MODERATE'" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > moderate
+
+$snpsift filter "ANN[0].IMPACT = 'LOW'" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > low
+
+for pred in Polyphen2_H{DIV,VAR} SIFT LRT FATHMM PROVEAN; do
+  $snpsift filter "((dbNSFP_${pred}_pred =~ 'D')" $vcf | bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > ${pred,,}
+done
+pred=MutationTaster
+$snpsift filter "((dbNSFP_${pred}_pred =~ '[AD]')" $vcf | bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > ${pred,,}
+pred=MutationAssessor
+$snpsift filter "((dbNSFP_${pred}_pred =~ '[HM]')" $vcf | bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq > ${pred,,}
+
+
+gzip -cd $known | awk -F"\t" '{split($9, a, ","); split($10, b, ","); for (i=1; i<length(a); i++) {from=$6>a[i]?$6:a[i]; 
+ to=$7<b[i]?$7:b[i]; if (to>from) print $2"\t"from-2"\t"to+2}}' | sed 's/^chr//' |
+  bedtools sort | bedtools merge | bedtools intersect -a <(bcftools query -f "%CHROM\t%POS\t%POS\t%CHROM:%POS:%REF:%ALT\n" $vcf) -b - |
+  cut -f4 | sort | uniq | join - <(cat {high,moderate,low} | sort | uniq) > known
+
+$snpsift filter "(ANN[0].EFFECT = 'synonymous_variant')" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq | join - known > synonymous
+
+$snpsift filter "(ANN[0].EFFECT = 'missense_variant') | (ANN[0].EFFECT = 'protein_protein_contact')" $vcf |
+  bcftools query -f "%CHROM:%POS:%REF:%ALT\n" | sort | uniq | join - known > missense
+
+join missense polyphen2_hdiv | join - polyphen2_hvar | join - sift | join - lrt |
+  join - mutationtaster | join - mutationassessor | join - provean > misdamaging
+
+join -a1 -v1 missense misdamaging > misbenign
+
+join -a1 -a2 misdamaging inframe | join -a1 -a2 - protein_protein_contact | join - known > damaging
+
+join -a1 -v1 high protein_protein_contact | join - known > disruptive
+
+join -a1 -a2 damaging disruptive > deleterious
+
+
+
+### STEP 5: SAVE VARIANTS IN DIFFERENT GENSETS ###
+## require SnpSift and the program annot2geneset.sh, which is available in the github repository
+
+
+
+for geneset in pHI09 pLOW01 pHIEbrain pLOEbrain pHIEbrainM pLOEbrainM PALLEBRAIN pMISS309; do
+  annot2geneset.sh SnpSift.jar output_vcf.annot.vcf.gz $geneset | sort | uniq > OUT.$geneset
+done
+
+
+### STEP 6: INTERSECT VARIANT ANNOTATIONS WITH GENESETS ###
+
+tokeep="list_of_individual_to_include_in_the_analysis.txt"
+pfx="SWE" # Study prefix, in this case SWE, but can be FIN for Finland, etc…
+
+for class in synonymous disruptive damaging; do
+  for geneset in pHI09 pLOW01 pHIEbrain pLOEbrain pHIEbrainM pLOEbrainM PALLEBRAIN pMISS309; do
+    join -t $'\t' -a1 -v1 <(sort singles) exac | join -t $'\t' - $class | join -t $'\t' - OUT.$geneset |
+      awk -F"\t" 'NR==FNR {SUM[$1]=0} NR>FNR {SUM[$2]++} END {for (iid in SUM) print iid"\t"SUM[iid]}' $stokeep - > $pfx.$geneset.$class.score
+  done
+done
+
+## This creates the synonimous score used as covariate for adjustment in the model ##
+join -t $'\t' -a1 -v1 <(sort singles) exac | join -t $'\t' - synonymous |
+  awk -F"\t" 'NR==FNR {SUM[$1]=0} NR>FNR {SUM[$2]++} END {for (iid in SUM) print iid"\t"SUM[iid]}' $stokeep - > $pfx.synonymous.score
+
+
+
+### -----> THESE SCORES ARE THEN USED DIRECTLY TO CREATE THE FIGURES ###
+
+
+
+### STEP 7: CREATE COMMON-VARIANT POLYGENIC SCORE ###
+
+
+plink --dosage plink_format_imputed_data \
+--fam plink_format_imputed_data.fam \
+--score summary_statistic_from_edu_attainment_GWAS 1 2 3 \
+--out common_var_polygene
+
