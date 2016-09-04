@@ -132,12 +132,3 @@ join -t $'\t' -a1 -v1 <(sort singles) exac | join -t $'\t' - synonymous |
 ### -----> THESE SCORES ARE THEN USED DIRECTLY TO CREATE THE FIGURES ###
 
 
-
-### STEP 7: CREATE COMMON-VARIANT POLYGENIC SCORE ###
-
-
-plink --dosage plink_format_imputed_data \
---fam plink_format_imputed_data.fam \
---score summary_statistic_from_edu_attainment_GWAS 1 2 3 \
---out common_var_polygene
-
